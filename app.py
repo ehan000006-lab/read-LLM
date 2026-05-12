@@ -8,7 +8,7 @@ Easy Read – LLM 기반 쉬운 글 변환 서비스
 """
 
 import streamlit as st
-import openai
+from groq import Groq
 import json
 import re
 import time
@@ -72,8 +72,8 @@ AMBER  = "#EF9F27"
 GRAY   = "#B4B2A9"
 DTEAL  = "#028090"
 
-MODEL_DEFAULT  = "gpt-4o-mini"
-MODEL_PREMIUM  = "gpt-4o"
+MODEL_DEFAULT  = "llama-3.3-70b-versatile"
+MODEL_PREMIUM  = "llama-3.3-70b-versatile"
 MAX_RETRIES    = 3
 RATE_LIMIT_WAIT = 2   # seconds (base)
 
@@ -129,7 +129,7 @@ _defaults = {
     "total_tokens": 0,
     "total_calls":  0,
     "avg_latency":  0.0,
-    "openai_key":   "",
+    "groq_key":     "",
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -166,14 +166,14 @@ def parse_json_safe(text: str):
 
 def get_client():
     try:
-        key = st.secrets.get("OPENAI_API_KEY", "")
+        key = st.secrets.get("GROQ_API_KEY", "")
     except Exception:
         key = ""
     if not key:
-        key = st.session_state.get("openai_key", "")
+        key = st.session_state.get("groq_key", "")
     if not key:
         return None
-    return openai.OpenAI(api_key=key)
+    return Groq(api_key=key)
 
 # ═══════════════════════════════════════════════════
 # 자동 디버깅 API 호출 래퍼
@@ -216,31 +216,29 @@ def safe_api_call(client, messages, model=MODEL_DEFAULT):
 
             return content, None, latency, tokens
 
-        except openai.RateLimitError as e:
-            wait = RATE_LIMIT_WAIT ** attempt
-            last_err = f"Rate Limit 초과 (시도 {attempt}): {e}"
-            log("WARN", f"{last_err} → {wait}초 대기 후 재시도")
-            time.sleep(wait)
-
-        except openai.AuthenticationError as e:
-            last_err = f"API 키 인증 실패: {e}"
-            log("ERROR", f"{last_err} → API 키를 사이드바에서 확인하세요")
-            break  # 재시도 불필요
-
-        except openai.APIConnectionError as e:
-            last_err = f"네트워크 연결 오류 (시도 {attempt}): {e}"
-            log("ERROR", f"{last_err} → 1초 대기 후 재시도")
-            time.sleep(1)
-
-        except openai.BadRequestError as e:
-            last_err = f"잘못된 요청 (입력 토큰 초과 가능성): {e}"
-            log("ERROR", f"{last_err} → 입력 텍스트를 짧게 분할하여 재시도 권장")
-            break
-
         except Exception as e:
-            last_err = f"예상치 못한 오류 (시도 {attempt}): {str(e)}"
-            log("ERROR", f"{last_err}\n스택: {traceback.format_exc()[:300]}")
-            time.sleep(1)
+            err_str = str(e)
+            if "rate_limit" in err_str.lower() or "429" in err_str:
+                wait = RATE_LIMIT_WAIT ** attempt
+                last_err = f"Rate Limit 초과 (시도 {attempt}): {e}"
+                log("WARN", f"{last_err} → {wait}초 대기 후 재시도")
+                time.sleep(wait)
+            elif "auth" in err_str.lower() or "401" in err_str or "invalid_api_key" in err_str.lower():
+                last_err = f"API 키 인증 실패: {e}"
+                log("ERROR", f"{last_err} → API 키를 사이드바에서 확인하세요")
+                break
+            elif "connection" in err_str.lower():
+                last_err = f"네트워크 연결 오류 (시도 {attempt}): {e}"
+                log("ERROR", f"{last_err} → 1초 대기 후 재시도")
+                time.sleep(1)
+            elif "token" in err_str.lower() or "context" in err_str.lower():
+                last_err = f"입력 토큰 초과 (시도 {attempt}): {e}"
+                log("ERROR", f"{last_err} → 입력 텍스트를 짧게 분할하여 재시도 권장")
+                break
+            else:
+                last_err = f"예상치 못한 오류 (시도 {attempt}): {str(e)}"
+                log("ERROR", f"{last_err}\n스택: {traceback.format_exc()[:300]}")
+                time.sleep(1)
 
     st.session_state.api_errors += 1
     return None, last_err, 0, 0
@@ -653,16 +651,16 @@ def fig_trend(history):
 # ═══════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("## ⚙️ 설정")
-    raw_key = st.text_input("OpenAI API 키", type="password",
-                             placeholder="sk-...",
-                             value=st.session_state.get("openai_key", ""))
+    raw_key = st.text_input("Groq API 키", type="password",
+                             placeholder="gsk_...",
+                             value=st.session_state.get("groq_key", ""))
     if raw_key:
-        st.session_state["openai_key"] = raw_key
+        st.session_state["groq_key"] = raw_key
 
     model_choice = st.selectbox("모델 선택",
-                                 ["gpt-4o-mini (권장, 무료급)", "gpt-4o (프리미엄, 고품질)"],
+                                 ["llama-3.3-70b-versatile (무료, 권장)"],
                                  index=0)
-    selected_model = MODEL_PREMIUM if "gpt-4o (" in model_choice else MODEL_DEFAULT
+    selected_model = MODEL_DEFAULT
 
     st.divider()
     st.markdown("### 📊 세션 통계")
@@ -681,6 +679,7 @@ with st.sidebar:
     if st.button("🗑 전체 초기화", use_container_width=True):
         for k, v in _defaults.items():
             st.session_state[k] = v if not isinstance(v, list) else []
+        st.session_state["groq_key"] = ""
         st.rerun()
 
 # ═══════════════════════════════════════════════════
@@ -721,7 +720,7 @@ with tabs[0]:
     if run_btn:
         client = get_client()
         if not client:
-            st.error("❌ OpenAI API 키를 사이드바에 입력해주세요.")
+            st.error("❌ Groq API 키를 사이드바에 입력해주세요.")
         else:
             with st.spinner("🔄 변환 중... 자동 디버깅 활성화"):
                 result, err = convert_text(client, user_text, selected_model)
@@ -916,14 +915,14 @@ with tabs[3]:
         avg_tokens = st.slider("문서당 평균 토큰 수", 500, 3000, 1200, step=100)
         monthly = daily_docs * 30
         total_tokens_month = monthly * avg_tokens
-        cost_mini  = total_tokens_month / 1_000_000 * 0.15 * 1350
+        cost_mini  = 0.0
         cost_4o    = total_tokens_month / 1_000_000 * 5.0  * 1350
         cost_groq  = 0.0
 
         cc1, cc2, cc3 = st.columns(3)
         cc1.metric("Groq (현재)", f"₩{cost_groq:,.0f}/월", delta="무료")
-        cc2.metric("GPT-4o-mini", f"₩{cost_mini:,.0f}/월")
-        cc3.metric("GPT-4o",      f"₩{cost_4o:,.0f}/월")
+        cc2.metric("GPT-4o-mini (참고)", f"₩{cost_mini:,.0f}/월")
+        cc3.metric("GPT-4o (참고)",      f"₩{cost_4o:,.0f}/월")
         st.caption(f"월 {monthly:,}건 처리 기준 | 총 {total_tokens_month/1_000_000:.2f}M tokens")
 
         # 최적화 가이드 표
