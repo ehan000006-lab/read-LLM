@@ -8,7 +8,7 @@ Easy Read – LLM 기반 쉬운 글 변환 서비스
 """
 
 import streamlit as st
-from groq import Groq
+from openai import OpenAI
 import json
 import re
 import time
@@ -72,8 +72,8 @@ AMBER  = "#EF9F27"
 GRAY   = "#B4B2A9"
 DTEAL  = "#028090"
 
-MODEL_DEFAULT  = "llama-3.3-70b-versatile"
-MODEL_PREMIUM  = "llama-3.3-70b-versatile"
+MODEL_DEFAULT  = "gpt-4o-mini"
+MODEL_PREMIUM  = "gpt-4o"
 MAX_RETRIES    = 3
 RATE_LIMIT_WAIT = 2   # seconds (base)
 
@@ -129,7 +129,7 @@ _defaults = {
     "total_tokens": 0,
     "total_calls":  0,
     "avg_latency":  0.0,
-    "groq_key":     "",
+    "openai_key":   "",
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -165,15 +165,22 @@ def parse_json_safe(text: str):
         return None, f"JSON 파싱 실패: {e}\n원본(앞 300자): {clean[:300]}"
 
 def get_client():
+    """
+    OpenAI API 클라이언트 생성.
+    우선순위: Streamlit Secrets의 OPENAI_API_KEY → 사이드바 입력값.
+
+    ※ OpenAI 크레딧은 API 키가 속한 OpenAI Platform 조직/프로젝트에서 차감됩니다.
+       기존 코드처럼 Groq 클라이언트를 쓰면 OpenAI 크레딧이 차감되지 않습니다.
+    """
     try:
-        key = st.secrets.get("GROQ_API_KEY", "")
+        key = st.secrets.get("OPENAI_API_KEY", "")
     except Exception:
         key = ""
     if not key:
-        key = st.session_state.get("groq_key", "")
+        key = st.session_state.get("openai_key", "")
     if not key:
         return None
-    return Groq(api_key=key)
+    return OpenAI(api_key=key)
 
 # ═══════════════════════════════════════════════════
 # 자동 디버깅 API 호출 래퍼
@@ -193,12 +200,18 @@ def safe_api_call(client, messages, model=MODEL_DEFAULT):
                 messages=messages,
                 temperature=0.3,
                 max_tokens=1800,
+                response_format={"type": "json_object"},
             )
             latency = round((time.time() - t0) * 1000)
-            tokens  = resp.usage.total_tokens if resp.usage else 0
+            usage = resp.usage
+            input_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+            output_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+            tokens = getattr(usage, "total_tokens", input_tokens + output_tokens) if usage else 0
             content = resp.choices[0].message.content
 
             st.session_state.total_tokens += tokens
+            st.session_state["last_input_tokens"] = input_tokens
+            st.session_state["last_output_tokens"] = output_tokens
             st.session_state.total_calls  += 1
             prev_avg = st.session_state.avg_latency
             n = st.session_state.total_calls
@@ -300,6 +313,9 @@ def convert_text(client, text: str, model=MODEL_DEFAULT):
     result["timestamp"]  = datetime.now().strftime("%Y-%m-%d %H:%M")
     result["latency_ms"] = latency
     result["tokens_used"]= tokens
+    # OpenAI 사용량/비용 추정을 위해 입력·출력 토큰을 별도로 보관
+    result["input_tokens"] = st.session_state.get("last_input_tokens", 0)
+    result["output_tokens"] = st.session_state.get("last_output_tokens", 0)
     result["model"]      = model
     result["input_hash"] = hashlib.md5(text_clean.encode()).hexdigest()[:8]
 
@@ -418,7 +434,7 @@ def analyze_optimization(r: dict, history: list) -> list:
         opts.append({
             "area": "모델 비용 최적화",
             "current": f"현재 성능 충분 (개선 {grade_imp:.1f}등급)",
-            "suggestion": "gpt-4o-mini 유지 권장. 추가 비용 없이 현재 품질 유지 가능.",
+            "suggestion": "gpt-4o-mini 유지 권장. gpt-4o보다 저렴하게 현재 품질 유지 가능.",
             "impact": "low",
             "action": "현재 설정 유지"
         })
@@ -499,7 +515,7 @@ def generate_report(r: dict, verify_results: list, opt_results: list) -> str:
         f"  의미 보존 점수  : {r['meaning_score']}/5점  (목표 4점↑ {'✅' if r['meaning_score'] >= 4 else '❌'})",
         f"  API 응답 속도   : {r.get('latency_ms', 0)}ms",
         f"  토큰 사용량     : {r.get('tokens_used', 0)} tokens",
-        f"  월 운영 비용    : ₩0 (Groq 무료 티어) / GPT-4o 전환 시 약 ₩26,000/월",
+        f"  월 운영 비용    : 실제 OpenAI 사용량 기준 차감 (입력·출력 토큰에 따라 변동)",
         "",
         "【문장 구조】",
         f"  문장 수         : {r['sentence_count_orig']}개 → {r['sentence_count_conv']}개",
@@ -651,16 +667,17 @@ def fig_trend(history):
 # ═══════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("## ⚙️ 설정")
-    raw_key = st.text_input("Groq API 키", type="password",
-                             placeholder="gsk_...",
-                             value=st.session_state.get("groq_key", ""))
+    raw_key = st.text_input("OpenAI API 키", type="password",
+                             placeholder="sk-...",
+                             value=st.session_state.get("openai_key", ""),
+                             help="Streamlit Cloud 배포 시에는 Settings → Secrets에 OPENAI_API_KEY를 등록하세요.")
     if raw_key:
-        st.session_state["groq_key"] = raw_key
+        st.session_state["openai_key"] = raw_key
 
     model_choice = st.selectbox("모델 선택",
-                                 ["llama-3.3-70b-versatile (무료, 권장)"],
+                                 ["gpt-4o-mini (저비용, 권장)", "gpt-4o (품질 우선)"],
                                  index=0)
-    selected_model = MODEL_DEFAULT
+    selected_model = MODEL_PREMIUM if model_choice.startswith("gpt-4o (") else MODEL_DEFAULT
 
     st.divider()
     st.markdown("### 📊 세션 통계")
@@ -679,7 +696,7 @@ with st.sidebar:
     if st.button("🗑 전체 초기화", use_container_width=True):
         for k, v in _defaults.items():
             st.session_state[k] = v if not isinstance(v, list) else []
-        st.session_state["groq_key"] = ""
+        st.session_state["openai_key"] = ""
         st.rerun()
 
 # ═══════════════════════════════════════════════════
@@ -720,7 +737,7 @@ with tabs[0]:
     if run_btn:
         client = get_client()
         if not client:
-            st.error("❌ Groq API 키를 사이드바에 입력해주세요.")
+            st.error("❌ OpenAI API 키를 사이드바에 입력하거나 Streamlit Secrets에 OPENAI_API_KEY를 등록해주세요.")
         else:
             with st.spinner("🔄 변환 중... 자동 디버깅 활성화"):
                 result, err = convert_text(client, user_text, selected_model)
@@ -914,16 +931,25 @@ with tabs[3]:
         daily_docs = st.slider("하루 처리 문서 수", 10, 500, 50, step=10)
         avg_tokens = st.slider("문서당 평균 토큰 수", 500, 3000, 1200, step=100)
         monthly = daily_docs * 30
-        total_tokens_month = monthly * avg_tokens
-        cost_mini  = 0.0
-        cost_4o    = total_tokens_month / 1_000_000 * 5.0  * 1350
-        cost_groq  = 0.0
+        input_ratio = st.slider("입력 토큰 비율(%)", 40, 90, 65, step=5) / 100
+        output_ratio = 1 - input_ratio
+        input_tokens_month = monthly * avg_tokens * input_ratio
+        output_tokens_month = monthly * avg_tokens * output_ratio
+        usd_krw = 1350
+        # 2026-05 기준 예시 단가. 실제 과금은 OpenAI Platform Billing/Usage 화면을 확인하세요.
+        price = {
+            "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+            "gpt-4o": {"input": 2.50, "output": 10.00},
+        }
+        cost_mini = ((input_tokens_month / 1_000_000) * price["gpt-4o-mini"]["input"] +
+                     (output_tokens_month / 1_000_000) * price["gpt-4o-mini"]["output"]) * usd_krw
+        cost_4o = ((input_tokens_month / 1_000_000) * price["gpt-4o"]["input"] +
+                   (output_tokens_month / 1_000_000) * price["gpt-4o"]["output"]) * usd_krw
 
-        cc1, cc2, cc3 = st.columns(3)
-        cc1.metric("Groq (현재)", f"₩{cost_groq:,.0f}/월", delta="무료")
-        cc2.metric("GPT-4o-mini (참고)", f"₩{cost_mini:,.0f}/월")
-        cc3.metric("GPT-4o (참고)",      f"₩{cost_4o:,.0f}/월")
-        st.caption(f"월 {monthly:,}건 처리 기준 | 총 {total_tokens_month/1_000_000:.2f}M tokens")
+        cc1, cc2 = st.columns(2)
+        cc1.metric("GPT-4o-mini 예상", f"₩{cost_mini:,.0f}/월", delta="저비용 권장")
+        cc2.metric("GPT-4o 예상",      f"₩{cost_4o:,.0f}/월", delta="품질 우선")
+        st.caption(f"월 {monthly:,}건 처리 기준 | 입력 {input_tokens_month/1_000_000:.2f}M + 출력 {output_tokens_month/1_000_000:.2f}M tokens")
 
         # 최적화 가이드 표
         st.markdown("---")
@@ -951,12 +977,12 @@ with tabs[4]:
     with dc1:
         st.markdown('<div class="exec-card"><b>🚀 지금 배포 가능한가?</b><br>'
                     '<span class="go-badge">GO</span><br>'
-                    '<small>핵심 기능 구현 완료. Streamlit Cloud 즉시 배포 가능. 운영비용 ₩0.</small></div>',
+                    '<small>핵심 기능 구현 완료. Streamlit Cloud 즉시 배포 가능. OpenAI 크레딧 기반 운영.</small></div>',
                     unsafe_allow_html=True)
     with dc2:
         st.markdown('<div class="exec-card"><b>💰 GPT-4o 전환 필요한가?</b><br>'
                     '<span class="watch-badge">WATCH</span><br>'
-                    '<small>현재 성능 충분. 전환 시 월 ₩26,000 추가. 성능 차이 측정 후 결정 권장.</small></div>',
+                    '<small>기본은 gpt-4o-mini 권장. 품질 부족 시 gpt-4o 전환 후 비용 비교 권장.</small></div>',
                     unsafe_allow_html=True)
     with dc3:
         st.markdown('<div class="exec-card"><b>📈 사업화 가능한가?</b><br>'
@@ -974,19 +1000,19 @@ with tabs[4]:
         k1.metric("어휘등급 개선", f"▼{gi:.1f}등급", delta="목표 0.5↑ 달성" if gi >= 0.5 else "목표 미달")
         k2.metric("쉬운단어 비율", f"{r['conv_easy_pct']}%", delta=f"+{r['conv_easy_pct']-r['orig_easy_pct']}%p")
         k3.metric("의미보존 점수", f"{r['meaning_score']}/5점")
-        k4.metric("월 운영비용",   "₩0", delta="Groq 무료")
+        k4.metric("월 운영비용",   "사용량 기반", delta="OpenAI 크레딧 차감")
     else:
         k1.metric("어휘등급 개선", "목표 ▼0.5↑")
         k2.metric("쉬운단어 비율", "목표 70%↑")
         k3.metric("의미보존 점수", "목표 4/5↑")
-        k4.metric("월 운영비용",   "₩0")
+        k4.metric("월 운영비용",   "사용량 기반")
 
     st.markdown("---")
 
     # 핵심 인사이트 5개
     st.markdown("#### 💡 핵심 인사이트 5개 (비즈니스 관점)")
     insights = [
-        ("1", "비용 경쟁력 절대적 우위", "Groq 무료 티어로 GPT-4o 대비 월 ₩26,000 절감. MVP 단계 비용 리스크 제로.", "수익성 ↑"),
+        ("1", "비용 경쟁력 절대적 우위", "gpt-4o-mini 사용 시 저비용으로 MVP 운영 가능. 실제 비용은 OpenAI 사용량 화면에서 확인.", "수익성 ↑"),
         ("2", "수백만 잠재 사용자 시장", "발달장애인 24만 + 고령자·외국인 포함 시 정부 복지 디지털화 수요와 직결.", "시장 규모 ↑"),
         ("3", "KPI 340% 초과달성", "어휘등급 개선 성공 기준(0.5) 대비 실제 1.7등급 개선 → 제품 경쟁력 검증 완료.", "제품 성능 ↑"),
         ("4", "B2G 납품 모델 적용 가능", "공공기관·복지부·지자체 대상 정부 조달 등록 가능. 장애인 정보접근성 의무화 정책 정합.", "사업화 ↑"),
@@ -1004,10 +1030,10 @@ with tabs[4]:
     st.markdown("#### 🛡 리스크 요인 및 대응방안")
     risks = [
         ("HIGH", "risk-h", "변환 오류 → 행정 피해", "5가지 자동 검증 + 면책 고지 + 원문 병렬 표시"),
-        ("HIGH", "risk-h", "Groq 무료 한도 초과(일 14,400 req)", "사용량 모니터링 + GPT-4o 전환 임계값(80%) 설정"),
+        ("HIGH", "risk-h", "OpenAI 크레딧·월 사용한도 초과", "OpenAI Usage 확인 + 월 예산/사용한도 80% 알림 기준 설정"),
         ("MID",  "risk-m", "개인정보 입력 사고",               "입력창 경고 + 미저장 + secrets.toml 관리"),
         ("MID",  "risk-m", "특정 문서 유형 성능 편차",          "문서 유형별 프롬프트 분기 + 도메인 테스트 10건+"),
-        ("LOW",  "risk-l", "API 비용 상승",                    "멀티 API 전환 구조 설계 (Groq↔GPT-4o↔Claude)"),
+        ("LOW",  "risk-l", "API 비용 상승",                    "멀티 모델 전환 구조 설계 (gpt-4o-mini↔gpt-4o↔타 모델)"),
     ]
     for lvl, cls, risk, action in risks:
         st.markdown(f'<div class="{cls}"><b>[{lvl}]</b> {risk}<br>'
@@ -1019,7 +1045,7 @@ with tabs[4]:
     st.markdown("#### 🗂 실행 가능한 액션 플랜")
     plan = [
         ("즉시", "#fdecea", "#e53935", "GitHub push → Streamlit Cloud 배포 → 링크 제출", "조현지", "D-day"),
-        ("즉시", "#fdecea", "#e53935", "OpenAI API 키 Secrets 등록 + 발표용 테스트 문서 3건 준비", "조현지", "발표 전날"),
+        ("즉시", "#fdecea", "#e53935", "Streamlit Secrets에 OPENAI_API_KEY 등록 + 발표용 테스트 문서 3건 준비", "조현지", "발표 전날"),
         ("단기", "#fff8e1", "#ffb300", "공공문서 10건 실측 → 어휘등급·의미보존 정량 데이터 확보", "황준연", "1주"),
         ("단기", "#fff8e1", "#ffb300", "발달장애인 보호자 3인 이상 이해도 평가 → 성능평가 완성", "한윤수",  "2주"),
         ("중기", "#e8f5e9", "#43a047", "문서 유형별 프롬프트 분기 최적화 → 성능 20% 향상 목표",  "전체팀",  "1개월"),
